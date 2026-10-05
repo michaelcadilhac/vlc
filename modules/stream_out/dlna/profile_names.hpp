@@ -107,6 +107,11 @@ enum dlna_media_class_t {
   DLNA_CLASS_COLLECTION
 };
 
+enum dlna_constraints_t {
+  DLNA_CONSTRAINTS_UNKNOWN,
+  DLNA_CONSTRAINTS_AVC_MAIN_HD_TS,
+};
+
 /**
  * DLNA profile.
  * This specifies the DLNA profile one file/stream is compatible with.
@@ -119,6 +124,7 @@ public:
     dlna_media_class_t media;
     vlc_fourcc_t video_codec;
     vlc_fourcc_t audio_codec;
+    dlna_constraints_t constraints = DLNA_CONSTRAINTS_UNKNOWN;
 
     dlna_profile_t()
         : video_codec(VLC_CODEC_UNKNOWN)
@@ -126,13 +132,15 @@ public:
         {}
 
     dlna_profile_t(std::string profile, std::string mux, std::string mime,
-            vlc_fourcc_t video, vlc_fourcc_t audio)
+            vlc_fourcc_t video, vlc_fourcc_t audio,
+            dlna_constraints_t constraints = DLNA_CONSTRAINTS_UNKNOWN)
         : name(std::move(profile))
         , mux(std::move(mux))
         , mime(std::move(mime))
         , media(DLNA_CLASS_AV)
         , video_codec(video)
         , audio_codec(audio)
+        , constraints(constraints)
         {}
 
     dlna_profile_t(std::string profile, std::string mux, std::string mime,
@@ -177,6 +185,26 @@ const dlna_profile_t default_image_profile = {
 };
 
 static const std::vector<dlna_profile_t> dlna_profile_list = {
+
+    /* DLNA Media Format Profiles 9.4.6-10: 188-byte ISO TS, AVC Main
+     * Profile level 4, HD video with AC-3 or AAC audio. Do not add the
+     * timestamped variants until the mux can produce 192-byte TTS. */
+    {
+        "AVC_TS_MP_HD_AC3_ISO",
+        "ts",
+        "video/mpeg",
+        VLC_CODEC_H264,
+        VLC_CODEC_A52,
+        DLNA_CONSTRAINTS_AVC_MAIN_HD_TS,
+    },
+    {
+        "AVC_TS_MP_HD_AAC_MULT5_ISO",
+        "ts",
+        "video/mpeg",
+        VLC_CODEC_H264,
+        VLC_CODEC_MP4A,
+        DLNA_CONSTRAINTS_AVC_MAIN_HD_TS,
+    },
 
     default_audio_profile,
     default_video_profile,

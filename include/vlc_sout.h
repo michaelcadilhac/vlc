@@ -223,6 +223,27 @@ enum sout_stream_query_e
      * \endcode
      */
     SOUT_STREAM_IS_SYNCHRONOUS,
+
+    /**
+     * Notify a renderer of the input URI (const char *). The module must
+     * copy it before returning. Unsupported modules can ignore this query.
+     */
+    SOUT_STREAM_SET_INPUT_URI,
+
+    /**
+     * Optional renderer pause/resume notification (int, promoted bool).
+     */
+    SOUT_STREAM_SET_PAUSE_STATE,
+
+    /**
+     * Optional renderer seek notification (vlc_tick_t, from file start).
+     */
+    SOUT_STREAM_SET_TIME,
+
+    /**
+     * Optional renderer stop notification (no arguments).
+     */
+    SOUT_STREAM_STOP,
 };
 
 typedef struct vlc_frame_t vlc_frame_t;

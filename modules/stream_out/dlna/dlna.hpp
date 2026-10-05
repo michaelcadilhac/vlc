@@ -26,29 +26,10 @@
 
 #include "../../services_discovery/upnp-wrapper.hpp"
 #include "dlna_common.hpp"
-#include "profile_names.hpp"
+#include "protocol_info.hpp"
 
 #include <sstream>
 #include <iomanip>
-
-struct protocol_info_t {
-    protocol_info_t() = default;
-    protocol_info_t(const protocol_info_t&) = default;
-
-    // aggregate initializers do not work in c++11
-    // for class types with default member initializers
-    protocol_info_t(dlna_transport_protocol_t transport,
-            dlna_org_conversion_t ci,
-            dlna_profile_t profile)
-        : transport(transport)
-        , ci(ci)
-        , profile(profile)
-        {}
-
-    dlna_transport_protocol_t transport = DLNA_TRANSPORT_PROTOCOL_HTTP;
-    dlna_org_conversion_t ci = DLNA_ORG_CONVERSION_NONE;
-    dlna_profile_t profile;
-};
 
 static inline std::string dlna_write_protocol_info(const protocol_info_t info,
                                                    const dlna_org_flags_t flags,
@@ -129,10 +110,13 @@ public:
 
     int Play(const char *speed);
     int Stop();
+    int Pause();
+    int Seek(vlc_tick_t time, bool paused = false);
+    int GetTransportState(std::string &state);
     std::vector<protocol_info_t> GetProtocolInfo();
     int PrepareForConnection(const char* protocol_str);
     int ConnectionComplete();
-    int SetAVTransportURI(const char* uri, const protocol_info_t& proto);
+    int SetAVTransportURI(const char* uri, const protocol_info_t& proto, uint64_t size = 0);
 };
 
 }

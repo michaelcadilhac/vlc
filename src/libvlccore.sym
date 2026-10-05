@@ -156,6 +156,7 @@ vlc_http_cookies_fetch
 httpd_ClientIP
 httpd_FileDelete
 httpd_FileNew
+httpd_FileNewFromFd
 httpd_HandlerDelete
 httpd_HandlerNew
 httpd_HostDelete

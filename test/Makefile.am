@@ -94,6 +94,7 @@ check_PROGRAMS = \
 	test_modules_playlist_m3u \
 	test_modules_stream_out_pcr_sync \
 	test_modules_stream_out_sdi \
+	test_modules_stream_out_dlna \
 	test_modules_tls \
 	test_modules_stream_out_transcode \
 	test_modules_mux_webvtt \
@@ -447,6 +448,11 @@ test_modules_video_output_opengl_sub_renderer_CPPFLAGS = $(AM_CPPFLAGS) -DVLC_TE
 test_modules_video_output_opengl_es2_sub_renderer_SOURCES = $(test_modules_video_output_opengl_sub_renderer_SOURCES)
 test_modules_video_output_opengl_es2_sub_renderer_LDADD = $(LIBVLCCORE) $(LIBVLC) $(LIBPLACEBO_LIBS) ../modules/libvlc_opengles.la
 test_modules_video_output_opengl_es2_sub_renderer_CPPFLAGS = $(AM_CPPFLAGS) -DVLC_TEST_OPENGL_API=VLC_OPENGL_ES2
+
+test_modules_stream_out_dlna_SOURCES = modules/stream_out/dlna.cpp \
+	../modules/stream_out/dlna/protocol_info.hpp \
+	../modules/stream_out/dlna/profile_names.hpp \
+	../src/network/httpd_file.h
 
 test_modules_stream_out_transcode_SOURCES = \
 	modules/stream_out/transcode.c \

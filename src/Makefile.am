@@ -375,6 +375,7 @@ libvlccore_la_SOURCES = \
 	video_output/vout_wrapper.c \
 	network/getaddrinfo.c \
 	network/http_auth.c \
+	network/httpd_file.h \
 	network/httpd.c \
 	network/io.c \
 	network/udp.c \

@@ -44,11 +44,14 @@
 #include <vlc_url.h>
 #include <vlc_mime.h>
 #include <vlc_block.h>
+#include <vlc_fs.h>
 #include "../libvlc.h"
+#include "httpd_file.h"
 
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #ifdef HAVE_SYS_UIO_H
 # include <sys/uio.h>
 #endif
@@ -147,6 +150,7 @@ struct httpd_client_t
     struct vlc_list node;
 
     bool    b_stream_mode;
+    bool    b_file_transfer;
     uint8_t i_state;
 
     vlc_tick_t i_timeout_date;
@@ -198,9 +202,9 @@ static const char *httpd_ReasonFromCode(unsigned i_code)
           { 202, "Accepted" },
           { 203, "Non-authoritative information" },
           { 204, "No content" },
-          { 205, "Reset content" },
-          { 206, "Partial content" },
-          { 250, "Low on storage space" },
+          { 205, "Reset content" },*/
+        { 206, "Partial content" },
+        /*{ 250, "Low on storage space" },
           { 300, "Multiple choices" },*/
         { 301, "Moved permanently" },
         /*{ 302, "Moved temporarily" },
@@ -223,9 +227,9 @@ static const char *httpd_ReasonFromCode(unsigned i_code)
           { 412, "Precondition failed" },
           { 413, "Request entity too large" },
           { 414, "Request-URI too large" },
-          { 415, "Unsupported media Type" },
-          { 416, "Requested range not satisfiable" },
-          { 417, "Expectation failed" },
+          { 415, "Unsupported media Type" },*/
+        { 416, "Requested range not satisfiable" },
+        /*{ 417, "Expectation failed" },
           { 451, "Parameter not understood" },
           { 452, "Conference not found" },
           { 453, "Not enough bandwidth" },*/
@@ -319,8 +323,77 @@ struct httpd_file_t
     httpd_url_t *url;
     httpd_file_callback_t pf_fill;
     httpd_file_sys_t      *p_sys;
+    int fd;
+    uint64_t size;
+    size_t header_count;
+    httpd_header *headers;
     char mime[1];
 };
+
+static int httpd_FileFdCallBack(httpd_file_t *file, httpd_client_t *cl,
+                                httpd_message_t *answer, const httpd_message_t *query)
+{
+    uint64_t start, length;
+    const char *range = httpd_MsgGet(query, "Range");
+    bool valid = httpd_file_range(range, file->size, &start, &length);
+    bool initial = answer->i_body_offset == 0;
+    answer->i_proto = HTTPD_PROTO_HTTP;
+    answer->i_version = 0;
+    answer->i_type = HTTPD_MSG_ANSWER;
+    if (initial)
+    {
+        answer->i_status = valid ? (range && *range ? 206 : 200) : 416;
+        httpd_MsgAdd(answer, "Content-Type", "%s", file->mime);
+        httpd_MsgAdd(answer, "Accept-Ranges", "bytes");
+        httpd_MsgAdd(answer, "Connection", "close");
+        for (size_t i = 0; i < file->header_count; ++i)
+            httpd_MsgAdd(answer, file->headers[i].name, "%s", file->headers[i].value);
+        if (!valid)
+        {
+            httpd_MsgAdd(answer, "Content-Range", "bytes */%"PRIu64, file->size);
+            httpd_MsgAdd(answer, "Content-Length", "0");
+            return VLC_SUCCESS;
+        }
+        httpd_MsgAdd(answer, "Content-Length", "%"PRIu64, length);
+        if (range && *range)
+            httpd_MsgAdd(answer, "Content-Range", "bytes %"PRIu64"-%"PRIu64"/%"PRIu64,
+                         start, start + length - 1, file->size);
+        if (query->i_type == HTTPD_MSG_HEAD || length == 0)
+            return VLC_SUCCESS;
+        cl->b_stream_mode = true;
+        /* A renderer may stop reading while paused. Keep a finite download
+         * open until the peer disconnects or the resource is deleted. */
+        cl->b_file_transfer = true;
+    }
+    uint64_t offset = initial ? start : (uint64_t)answer->i_body_offset - 1;
+    size_t count = __MIN(start + length - offset, UINT64_C(65536));
+    uint8_t *data = malloc(count);
+    if (!data)
+    {
+        answer->i_body_offset = 0;
+        return VLC_EGENERIC;
+    }
+    /* Callbacks on one host are serialized by the host lock. */
+    ssize_t bytes;
+    if (lseek(file->fd, offset, SEEK_SET) < 0)
+        bytes = -1;
+    else
+        do
+        {
+            bytes = read(file->fd, data, count);
+        } while (bytes < 0 && errno == EINTR);
+    if (bytes <= 0)
+    {
+        free(data);
+        answer->i_body_offset = 0;
+        return VLC_EGENERIC;
+    }
+    answer->p_body = data;
+    answer->i_body = bytes;
+    offset += bytes;
+    answer->i_body_offset = offset < start + length ? offset + 1 : 0;
+    return VLC_SUCCESS;
+}
 
 static int
 httpd_FileCallBack(httpd_callback_sys_t *p_sys, httpd_client_t *cl,
@@ -332,6 +405,9 @@ httpd_FileCallBack(httpd_callback_sys_t *p_sys, httpd_client_t *cl,
 
     if (!answer || !query )
         return VLC_SUCCESS;
+
+    if (file->fd != -1)
+        return httpd_FileFdCallBack(file, cl, answer, query);
 
     answer->i_proto  = HTTPD_PROTO_HTTP;
     answer->i_version= 1;
@@ -392,6 +468,9 @@ httpd_file_t *httpd_FileNew(httpd_host_t *host,
         return NULL;
     }
 
+    file->fd = -1;
+    file->header_count = 0;
+    file->headers = NULL;
     file->pf_fill = pf_fill;
     file->p_sys   = p_sys;
     memcpy(file->mime, mime, mimelen + 1);
@@ -406,11 +485,74 @@ httpd_file_t *httpd_FileNew(httpd_host_t *host,
     return file;
 }
 
+httpd_file_t *httpd_FileNewFromFd(httpd_host_t *host, const char *url,
+                                  const char *mime, int fd,
+                                  const httpd_header *headers, size_t header_count)
+{
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0)
+        return NULL;
+    int copy = vlc_dup(fd);
+    if (copy == -1)
+        return NULL;
+    /* Prepare the object completely before registering its URL callbacks. */
+    size_t mimelen = strlen(mime);
+    httpd_file_t *file = calloc(1, sizeof(*file) + mimelen);
+    if (!file)
+    {
+        vlc_close(copy);
+        return NULL;
+    }
+    file->fd = copy;
+    file->size = st.st_size;
+    memcpy(file->mime, mime, mimelen + 1);
+    if (header_count)
+    {
+        file->headers = calloc(header_count, sizeof(*file->headers));
+        if (!file->headers)
+            goto error;
+        for (size_t i = 0; i < header_count; ++i)
+        {
+            file->header_count = i + 1;
+            file->headers[i].name = strdup(headers[i].name);
+            file->headers[i].value = strdup(headers[i].value);
+            if (!file->headers[i].name || !file->headers[i].value)
+                goto error;
+        }
+    }
+    file->url = httpd_UrlNew(host, url, NULL, NULL);
+    if (!file->url)
+        goto error;
+    httpd_UrlCatch(file->url, HTTPD_MSG_HEAD, httpd_FileCallBack,
+                  (httpd_callback_sys_t *)file);
+    httpd_UrlCatch(file->url, HTTPD_MSG_GET, httpd_FileCallBack,
+                  (httpd_callback_sys_t *)file);
+    return file;
+error:
+    for (size_t i = 0; i < file->header_count; ++i)
+    {
+        free(file->headers[i].name);
+        free(file->headers[i].value);
+    }
+    free(file->headers);
+    vlc_close(copy);
+    free(file);
+    return NULL;
+}
+
 httpd_file_sys_t *httpd_FileDelete(httpd_file_t *file)
 {
     httpd_file_sys_t *p_sys = file->p_sys;
 
     httpd_UrlDelete(file->url);
+    if (file->fd != -1)
+        vlc_close(file->fd);
+    for (size_t i = 0; i < file->header_count; ++i)
+    {
+        free(file->headers[i].name);
+        free(file->headers[i].value);
+    }
+    free(file->headers);
     free(file);
     return p_sys;
 }
@@ -744,7 +886,8 @@ static int httpd_StreamCallBack(httpd_callback_sys_t *p_sys,
                 cl->i_keyframe_wait_to_pass = -1;
             vlc_mutex_unlock(&stream->lock);
         } else {
-            httpd_MsgAdd(answer, "Content-Length", "0");
+            /* A HEAD response describes the GET representation. A live
+             * stream has unknown length; zero incorrectly claims it is empty. */
             answer->i_body_offset = 0;
         }
 
@@ -1271,6 +1414,7 @@ static httpd_client_t *httpd_ClientNew(vlc_tls_t *sock)
     cl->p_buffer = xmalloc(cl->i_buffer_size);
     cl->i_keyframe_wait_to_pass = -1;
     cl->b_stream_mode = false;
+    cl->b_file_transfer = false;
 
     httpd_MsgInit(&cl->query);
     httpd_MsgInit(&cl->answer);
@@ -1765,7 +1909,8 @@ static void httpdLoop(httpd_host_t *host)
         }
 
         if (cl->i_state == HTTPD_CLIENT_DEAD
-         || (host->timeout_sec > 0 && cl->i_timeout_date < now)) {
+         || (host->timeout_sec > 0 && cl->i_timeout_date < now
+             && !cl->b_file_transfer)) {
             host->client_count--;
             httpd_ClientDestroy(cl);
             continue;

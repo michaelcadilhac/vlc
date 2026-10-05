@@ -815,6 +815,9 @@ static int InitSout( input_thread_t * p_input )
         input_resource_TerminateSout( priv->p_resource );
     }
     free( psz );
+    if (priv->p_sout)
+        sout_StreamControl(priv->p_sout, SOUT_STREAM_SET_INPUT_URI,
+                           priv->p_item->psz_uri);
 
     return VLC_SUCCESS;
 }
@@ -1434,6 +1437,8 @@ static void End( input_thread_t * p_input )
     input_thread_private_t *priv = input_priv(p_input);
 
     /* We are at the end */
+    if (priv->p_sout && input_Stopped(p_input))
+        sout_StreamControl(priv->p_sout, SOUT_STREAM_STOP);
     input_ChangeState( p_input, END_S, VLC_TICK_INVALID );
 
     /* Stop es out activity */
@@ -1756,6 +1761,10 @@ static void ControlPause(input_thread_t *p_input, vlc_tick_t i_control_date,
         }
     }
 
+    if (input_priv(p_input)->p_sout)
+        sout_StreamControl(input_priv(p_input)->p_sout,
+                           SOUT_STREAM_SET_PAUSE_STATE, true);
+
     /* Check if in buffering state, and if so, deferred the pasue
      * instead of trying to pause the media playback right away, since
      * the playback and the clocks are not even configured yet.
@@ -1801,6 +1810,10 @@ static void ControlUnpause( input_thread_t *p_input, vlc_tick_t i_control_date )
     }
 
     input_priv(p_input)->b_pause_after_buffering = false;
+
+    if (input_priv(p_input)->p_sout)
+        sout_StreamControl(input_priv(p_input)->p_sout,
+                           SOUT_STREAM_SET_PAUSE_STATE, false);
 
     /* Switch to play */
     input_ChangeState( p_input, PLAYING_S, i_control_date );
@@ -1983,6 +1996,9 @@ static int ControlSetTime( input_thread_t *p_input, vlc_tick_t val,
 
     if( i_ret == VLC_SUCCESS )
     {
+        if (priv->p_sout)
+            sout_StreamControl(priv->p_sout, SOUT_STREAM_SET_TIME,
+                               priv->i_start + val);
         if( priv->i_slave > 0 )
             SlaveSeek( p_input );
         priv->master->b_eof = false;
@@ -2010,6 +2026,9 @@ static int ControlSetPosition( input_thread_t *p_input, double val,
 
     if( i_ret == VLC_SUCCESS )
     {
+        if (priv->p_sout && i_length > 0)
+            sout_StreamControl(priv->p_sout, SOUT_STREAM_SET_TIME,
+                               (vlc_tick_t)(val * i_length));
         if( priv->i_slave > 0 )
             SlaveSeek( p_input );
         priv->master->b_eof = false;

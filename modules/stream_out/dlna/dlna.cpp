@@ -37,6 +37,12 @@
 #include <vlc_rand.h>
 #include <vlc_sout.h>
 #include <vlc_block.h>
+#include <vlc_httpd.h>
+#include <vlc_fs.h>
+#include <vlc_url.h>
+#include <vlc_mime.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 static const char* AV_TRANSPORT_SERVICE_TYPE = "urn:schemas-upnp-org:service:AVTransport:1";
 static const char* CONNECTION_MANAGER_SERVICE_TYPE = "urn:schemas-upnp-org:service:ConnectionManager:1";
@@ -70,9 +76,18 @@ struct sout_stream_sys_t
     std::shared_ptr<MediaRenderer> renderer;
     UpnpInstanceWrapper *p_upnp;
 
-    ProtocolPtr canDecodeAudio( vlc_fourcc_t i_codec ) const;
-    ProtocolPtr canDecodeVideo( vlc_fourcc_t audio_codec,
-                         vlc_fourcc_t video_codec ) const;
+    ProtocolPtr canDecodeAudio( const es_format_t *audio ) const;
+    ProtocolPtr canDecodeVideo( const es_format_t *audio,
+                                const es_format_t *video ) const;
+    bool StartFile( sout_stream_t * );
+    void CloseFile();
+    std::string input_uri;
+    httpd_host_t *file_host = nullptr;
+    httpd_file_t *file = nullptr;
+    bool file_paused = false;
+    bool file_stopped = false;
+    vlc_tick_t file_position = 0;
+    int Send( sout_stream_t *, sout_stream_id_sys_t *, block_t * );
     bool startSoutChain( sout_stream_t* p_stream,
                          const std::vector<sout_stream_id_sys_t*> &new_streams,
                          const std::string &sout );
@@ -111,43 +126,24 @@ std::string dlna_write_protocol_info (const protocol_info_t info)
                                    DLNA_ORG_FLAG_BACKGROUND_TRANSFERT_MODE |
                                    DLNA_ORG_FLAG_CONNECTION_STALL |
                                    DLNA_ORG_FLAG_DLNA_V15;
-  return dlna_write_protocol_info(info, flags, DLNA_ORG_OPERATION_RANGE);
+  return dlna_write_protocol_info(info, flags, info.operation);
 }
 
-std::vector<std::string> split(const std::string &s, char delim) {
-    std::stringstream ss(s);
-    std::string item;
-    std::vector<std::string> elems;
-    while (std::getline(ss, item, delim)) {
-        elems.push_back(std::move(item));
-    }
-    return elems;
-}
-
-ProtocolPtr sout_stream_sys_t::canDecodeAudio(vlc_fourcc_t audio_codec) const
+ProtocolPtr sout_stream_sys_t::canDecodeAudio(const es_format_t *audio) const
 {
-    for (protocol_info_t protocol : device_protocols) {
-        if (protocol.profile.media == DLNA_CLASS_AUDIO
-                && protocol.profile.audio_codec == audio_codec)
-        {
-            return std::unique_ptr<protocol_info_t>(new protocol_info_t(protocol));
-        }
-    }
-    return nullptr;
+    const auto *protocol = dlna_select_protocol(device_protocols,
+                                                DLNA_CLASS_AUDIO, audio->i_codec,
+                                                VLC_CODEC_NONE, audio);
+    return protocol ? make_protocol(*protocol) : nullptr;
 }
 
-ProtocolPtr sout_stream_sys_t::canDecodeVideo(vlc_fourcc_t audio_codec,
-                vlc_fourcc_t video_codec) const
+ProtocolPtr sout_stream_sys_t::canDecodeVideo(const es_format_t *audio,
+                                              const es_format_t *video) const
 {
-    for (protocol_info_t protocol : device_protocols) {
-        if (protocol.profile.media == DLNA_CLASS_AV
-                && protocol.profile.audio_codec == audio_codec
-                && protocol.profile.video_codec == video_codec)
-        {
-            return std::unique_ptr<protocol_info_t>(new protocol_info_t(protocol));
-        }
-    }
-    return nullptr;
+    const auto *protocol = dlna_select_protocol(device_protocols,
+                                                DLNA_CLASS_AV, audio ? audio->i_codec : VLC_CODEC_NONE,
+                                                video->i_codec, audio, video);
+    return protocol ? make_protocol(*protocol) : nullptr;
 }
 
 bool sout_stream_sys_t::startSoutChain(sout_stream_t *p_stream,
@@ -225,6 +221,120 @@ sout_stream_id_sys_t *sout_stream_sys_t::GetSubId( sout_stream_t *p_stream,
     return nullptr;
 }
 
+/* A local file that the renderer advertises by MIME can be served intact.
+ * This supplies finite length and seeking, which a live remux cannot provide. */
+bool sout_stream_sys_t::StartFile(sout_stream_t *p_stream)
+{
+    if (input_uri.compare(0, 7, "file://") != 0)
+        return false;
+    auto path = vlc::wrap_cptr(vlc_uri2path(input_uri.c_str()));
+    if (!path)
+        return false;
+    std::string mime = vlc_mime_Ext2Mime(path.get());
+    if (!b_supports_video && mime.compare(0, 6, "audio/") != 0)
+        return false;
+    auto supported = [&](const std::string &candidate) {
+        for (const auto &protocol : device_protocols)
+            if (!protocol.exact_match && protocol.profile.mime == candidate)
+                return true;
+        return false;
+    };
+    if (!supported(mime))
+    {
+        /* Samsung uses the older Matroska MIME alias in GetProtocolInfo. */
+        if (mime == "video/x-matroska" && supported("video/x-mkv"))
+            mime = "video/x-mkv";
+        else
+            return false;
+    }
+    int fd = vlc_open(path.get(), O_RDONLY | O_NONBLOCK);
+    if (fd == -1)
+        return false;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0)
+    {
+        vlc_close(fd);
+        return false;
+    }
+    protocol_info_t protocol;
+    protocol.profile = dlna_profile_t("*", "", mime,
+        mime.compare(0, 6, "audio/") == 0 ? DLNA_CLASS_AUDIO : DLNA_CLASS_AV,
+        VLC_CODEC_UNKNOWN, VLC_CODEC_UNKNOWN);
+    protocol.operation = DLNA_ORG_OPERATION_RANGE;
+    const std::string protocol_info = dlna_write_protocol_info(protocol);
+    const std::string features = protocol_info.substr(protocol_info.find(':',
+        protocol_info.find(':', protocol_info.find(':') + 1) + 1) + 1);
+    const httpd_header headers[] = {
+        {const_cast<char *>("contentFeatures.dlna.org"), const_cast<char *>(features.c_str())},
+        {const_cast<char *>("transferMode.dlna.org"), const_cast<char *>("Streaming")},
+    };
+    const std::string root = "/dlna/" + std::to_string(vlc_tick_now()) + "/"
+        + std::to_string(static_cast<uint64_t>(vlc_mrand48())) + "/file";
+    var_Create(p_stream, "http-port", VLC_VAR_INTEGER);
+    var_SetInteger(p_stream, "http-port", http_port);
+    file_host = vlc_http_HostNew(VLC_OBJECT(p_stream));
+    if (file_host)
+        file = httpd_FileNewFromFd(file_host, root.c_str(), mime.c_str(), fd,
+                                  headers, ARRAY_SIZE(headers));
+    vlc_close(fd);
+    auto ip = vlc::wrap_cptr(getServerIPAddress());
+    if (!file || !ip)
+    {
+        CloseFile();
+        return false;
+    }
+    const std::string uri = "http://" + std::string(ip.get()) + ":"
+        + std::to_string(http_port) + root;
+    msg_Dbg(p_stream, "Serving original local file as %s (%" PRIu64 " bytes)",
+            mime.c_str(), static_cast<uint64_t>(st.st_size));
+    renderer->Stop();
+    if (renderer->PrepareForConnection(protocol_info.c_str()) != VLC_SUCCESS
+        || renderer->SetAVTransportURI(uri.c_str(), protocol, st.st_size) != VLC_SUCCESS
+        || renderer->Play("1") != VLC_SUCCESS
+        || (file_position > 0 && renderer->Seek(file_position, file_paused) != VLC_SUCCESS)
+        || (file_position == 0 && file_paused && renderer->Pause() != VLC_SUCCESS))
+    {
+        CloseFile();
+        return false;
+    }
+    msg_Dbg(p_stream, "AVTransportURI: %s", uri.c_str());
+    return true;
+}
+
+void sout_stream_sys_t::CloseFile()
+{
+    if (file)
+        httpd_FileDelete(file);
+    if (file_host)
+        httpd_HostDelete(file_host);
+    file = nullptr;
+    file_host = nullptr;
+}
+
+int sout_stream_sys_t::Send(sout_stream_t *p_stream,
+                            sout_stream_id_sys_t *id, block_t *buffer)
+{
+    if (UpdateOutput(p_stream) != VLC_SUCCESS)
+    {
+        block_ChainRelease(buffer);
+        return VLC_EGENERIC;
+    }
+    if (file)
+    {
+        /* The renderer reads the original file directly. Packetization here
+         * only maintains the input's normal pacing and lifetime. */
+        block_ChainRelease(buffer);
+        return VLC_SUCCESS;
+    }
+    auto *sub_id = GetSubId(p_stream, id, false);
+    if (!sub_id)
+    {
+        block_ChainRelease(buffer);
+        return VLC_EGENERIC;
+    }
+    return sout_StreamIdSend(p_out, sub_id, buffer);
+}
+
 std::string
 sout_stream_sys_t::GetAcodecOption( sout_stream_t *p_stream, vlc_fourcc_t *p_codec_audio,
                                     const audio_format_t *p_aud, int i_quality )
@@ -249,10 +359,14 @@ int sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
 {
     assert( p_stream->p_sys == this );
 
+    if (file_stopped)
+        return VLC_EGENERIC;
     if ( !es_changed )
         return VLC_SUCCESS;
 
     es_changed = false;
+    if (file || StartFile(p_stream))
+        return VLC_SUCCESS;
 
     bool canRemux = true;
     // To keep track of which stream needs transcoding if at all.
@@ -283,7 +397,7 @@ int sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
     // check if we have an audio only stream
     if (!p_original_video && p_original_audio)
     {
-        if( !(stream_protocol = canDecodeAudio(p_original_audio->i_codec)) )
+        if( !(stream_protocol = canDecodeAudio(p_original_audio)) )
         {
             msg_Dbg( p_stream, "can't remux audio track %d codec %4.4s",
                 p_original_audio->i_id, (const char*)&p_original_audio->i_codec );
@@ -296,8 +410,7 @@ int sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
     // video only stream
     else if (p_original_video && !p_original_audio)
     {
-        if( !(stream_protocol = canDecodeVideo(VLC_CODEC_NONE,
-                        p_original_video->i_codec)) )
+        if( !(stream_protocol = canDecodeVideo(nullptr, p_original_video)) )
         {
             msg_Dbg(p_stream, "can't remux video track %d codec: %4.4s",
                 p_original_video->i_id, (const char*)&p_original_video->i_codec);
@@ -309,8 +422,7 @@ int sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
     }
     else
     {
-        if( !(stream_protocol = canDecodeVideo( p_original_audio->i_codec,
-                        p_original_video->i_codec)) )
+        if( !(stream_protocol = canDecodeVideo(p_original_audio, p_original_video)) )
         {
             msg_Dbg(p_stream, "can't remux video track %d with audio: %4.4s and video: %4.4s",
                 p_original_video->i_id, (const char*)&p_original_audio->i_codec,
@@ -350,7 +462,7 @@ int sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
                            "could quickly drain your battery." ) );
             perf_warning_shown = true;
             if ( res <= 0 )
-                 return false;
+                 return VLC_EGENERIC;
             if ( res == 2 )
                 config_PutInt(RENDERER_CFG_PREFIX "show-perf-warning", 0 );
         }
@@ -387,9 +499,13 @@ int sout_stream_sys_t::UpdateOutput( sout_stream_t *p_stream )
        << "/stream";
     std::string root_url = ss.str();
 
+    const std::string protocol_info = dlna_write_protocol_info(*stream_protocol);
+    const std::size_t additional_info = protocol_info.find(':',
+        protocol_info.find(':', protocol_info.find(':') + 1) + 1) + 1;
     ssout << "http{dst=:" << http_port << root_url
           << ",mux=" << stream_protocol->profile.mux
-          << ",access=http{mime=" << stream_protocol->profile.mime << "}}";
+          << ",access=http{mime=" << stream_protocol->profile.mime
+          << ",dlna=" << protocol_info.substr(additional_info) << "}}";
 
     auto ip = vlc::wrap_cptr<char>(getServerIPAddress());
     if (ip == nullptr)
@@ -532,6 +648,75 @@ int MediaRenderer::Stop()
     return VLC_SUCCESS;
 }
 
+int MediaRenderer::Pause()
+{
+    IXML_Document *response = SendAction("Pause", AV_TRANSPORT_SERVICE_TYPE,
+                                         {{"InstanceID", AVTransportID.c_str()}});
+    if (!response)
+        return VLC_EGENERIC;
+    ixmlDocument_free(response);
+    return VLC_SUCCESS;
+}
+
+int MediaRenderer::GetTransportState(std::string &state)
+{
+    state.clear();
+    IXML_Document *response = SendAction("GetTransportInfo", AV_TRANSPORT_SERVICE_TYPE,
+                                         {{"InstanceID", AVTransportID.c_str()}});
+    if (!response)
+        return VLC_EGENERIC;
+    IXML_NodeList *nodes = ixmlDocument_getElementsByTagName(response,
+                                                             "CurrentTransportState");
+    if (nodes)
+    {
+        IXML_Node *node = ixmlNodeList_item(nodes, 0);
+        if (node)
+            node = ixmlNode_getFirstChild(node);
+        const char *value = node ? ixmlNode_getNodeValue(node) : nullptr;
+        if (value)
+            state = value;
+        ixmlNodeList_free(nodes);
+    }
+    ixmlDocument_free(response);
+    return state.empty() ? VLC_EGENERIC : VLC_SUCCESS;
+}
+
+int MediaRenderer::Seek(vlc_tick_t time, bool paused)
+{
+    const std::string target = dlna_seek_time(time);
+    if (target.empty())
+        return VLC_EGENERIC;
+    IXML_Document *response = SendAction("Seek", AV_TRANSPORT_SERVICE_TYPE,
+        {{"InstanceID", AVTransportID.c_str()}, {"Unit", "REL_TIME"},
+         {"Target", target.c_str()}});
+    if (!response)
+        return VLC_EGENERIC;
+    ixmlDocument_free(response);
+    if (!paused)
+        return VLC_SUCCESS;
+
+    /* Samsung rejects Pause while its asynchronous seek is transitioning.
+     * Wait for a usable state, then restore pause; never replace the URI. */
+    const vlc_tick_t deadline = vlc_tick_now() + VLC_TICK_FROM_SEC(5);
+    do
+    {
+        std::string state;
+        if (GetTransportState(state) != VLC_SUCCESS)
+            return VLC_EGENERIC;
+        if (state == "PAUSED_PLAYBACK")
+            return VLC_SUCCESS;
+        if (state == "PLAYING" && Pause() == VLC_SUCCESS)
+            return VLC_SUCCESS;
+        if (state != "PLAYING" && state != "TRANSITIONING")
+            break;
+        if (vlc_tick_now() >= deadline)
+            break;
+        vlc_tick_sleep(VLC_TICK_FROM_MS(100));
+    } while (vlc_tick_now() < deadline);
+    msg_Err(parent, "Unable to restore paused state after renderer seek");
+    return VLC_EGENERIC;
+}
+
 std::vector<protocol_info_t> MediaRenderer::GetProtocolInfo()
 {
     std::string protocol_csv;
@@ -563,46 +748,16 @@ std::vector<protocol_info_t> MediaRenderer::GetProtocolInfo()
     ixmlDocument_free(response);
 
     msg_Dbg(parent, "Device supports protocols: %s", protocol_csv.c_str());
-    // parse the CSV list
-    // format: <transportProtocol>:<network>:<mime>:<additionalInfo>
-    std::vector<std::string> protocols = split(protocol_csv, ',');
-    for (std::string protocol : protocols ) {
-        std::vector<std::string> protocol_info = split(protocol, ':');
-
-        // We only support http transport for now.
-        if (protocol_info.size() == 4 && protocol_info.at(0) == "http-get")
-        {
-            protocol_info_t proto;
-
-            // Get the DLNA profile name
-            std::string profile_name;
-            std::string tag = "DLNA.ORG_PN=";
-            std::size_t index = protocol_info.at(3).find(tag);
-
-            if (protocol_info.at(3) == "*")
-            {
-               profile_name = "*";
-            }
-            else if (index != std::string::npos)
-            {
-                std::size_t end = protocol_info.at(3).find(';', index + 1);
-                int start = index + tag.length() - 1;
-                int length = end - start;
-                profile_name = protocol_info.at(3).substr(start, length);
-            }
-
-            // Match our supported profiles to device profiles
-            for (dlna_profile_t profile : dlna_profile_list) {
-                if (protocol_info.at(2) == profile.mime
-                        && (profile_name == profile.name || profile_name == "*"))
-                {
-                    proto.profile = std::move(profile);
-                    supported_protocols.push_back(proto);
-                    // we do not break here to account for wildcards
-                    // as protocolInfo's fourth field aka <additionalInfo>
-                }
-            }
-        }
+    supported_protocols = dlna_parse_protocols(protocol_csv);
+    for (std::size_t i = 0; i < supported_protocols.size(); ++i)
+    {
+        const auto &protocol = supported_protocols[i];
+        msg_Dbg(parent, "DLNA match %zu (%s): %s -> %s:%s audio %.4s video %.4s",
+                i, protocol.exact_match ? "exact" : "wildcard",
+                protocol.renderer_protocol.c_str(), protocol.profile.mime.c_str(),
+                protocol.profile.name.c_str(),
+                reinterpret_cast<const char *>(&protocol.profile.audio_codec),
+                reinterpret_cast<const char *>(&protocol.profile.video_codec));
     }
 
     msg_Dbg( parent , "Got %zu supported profiles", supported_protocols.size() );
@@ -697,7 +852,7 @@ int MediaRenderer::ConnectionComplete()
     return VLC_SUCCESS;
 }
 
-int MediaRenderer::SetAVTransportURI(const char* uri, const protocol_info_t& proto)
+int MediaRenderer::SetAVTransportURI(const char* uri, const protocol_info_t& proto, uint64_t size)
 {
     static const char didl[] =
         "<DIDL-Lite "
@@ -708,17 +863,19 @@ int MediaRenderer::SetAVTransportURI(const char* uri, const protocol_info_t& pro
         "<item id=\"f-0\" parentID=\"0\" restricted=\"0\">"
         "<dc:title>%s</dc:title>"
         "<upnp:class>%s</upnp:class>"
-        "<res protocolInfo=\"%s\">%s</res>"
+        "<res %s protocolInfo=\"%s\">%s</res>"
         "</item>"
         "</DIDL-Lite>";
 
     bool audio = proto.profile.media == DLNA_CLASS_AUDIO;
     std::string dlna_protocol = dlna_write_protocol_info(proto);
 
+    const std::string size_attribute = size ? "size=\"" + std::to_string(size) + "\"" : "";
     char *meta_data;
     if (asprintf(&meta_data, didl,
                 audio ? "Audio" : "Video",
                 audio ? "object.item.audioItem" : "object.item.videoItem",
+                size_attribute.c_str(),
                 dlna_protocol.c_str(),
                 uri) < 0) {
         return VLC_ENOMEM;
@@ -762,6 +919,17 @@ Add(sout_stream_t *p_stream, const es_format_t *p_fmt, const char *es_id)
         p_sys_id->p_sub_id = nullptr;
         p_sys->streams.push_back(p_sys_id);
         p_sys->es_changed = true;
+        msg_Dbg(p_stream, "Discovered ES %.4s profile %d level %d bitrate %u",
+                reinterpret_cast<const char *>(&p_fmt->i_codec),
+                p_fmt->i_profile, p_fmt->i_level, p_fmt->i_bitrate);
+        if (p_fmt->i_cat == VIDEO_ES)
+            msg_Dbg(p_stream, "Video %ux%u visible %ux%u frame rate %u/%u",
+                    p_fmt->video.i_width, p_fmt->video.i_height,
+                    p_fmt->video.i_visible_width, p_fmt->video.i_visible_height,
+                    p_fmt->video.i_frame_rate, p_fmt->video.i_frame_rate_base);
+        else if (p_fmt->i_cat == AUDIO_ES)
+            msg_Dbg(p_stream, "Audio %u Hz %u channels, config %zu bytes",
+                    p_fmt->audio.i_rate, p_fmt->audio.i_channels, p_fmt->i_extra);
     }
     return p_sys_id;
 }
@@ -772,19 +940,14 @@ static int Send(sout_stream_t *p_stream, void *id,
     sout_stream_sys_t *p_sys = static_cast<sout_stream_sys_t *>( p_stream->p_sys );
     sout_stream_id_sys_t *id_sys = static_cast<sout_stream_id_sys_t*>( id );
 
-    id_sys = p_sys->GetSubId( p_stream, id_sys );
-    if ( id_sys == nullptr )
-    {
-        block_Release( p_buffer );
-        return VLC_EGENERIC;
-    }
-
-    return sout_StreamIdSend(p_sys->p_out, id_sys, p_buffer);
+    return p_sys->Send(p_stream, id_sys, p_buffer);
 }
 
 static void Flush( sout_stream_t *p_stream, void *id )
 {
     sout_stream_sys_t *p_sys = static_cast<sout_stream_sys_t *>( p_stream->p_sys );
+    if (p_sys->file)
+        return; /* A demux seek does not invalidate the original resource. */
     sout_stream_id_sys_t *id_sys = static_cast<sout_stream_id_sys_t*>( id );
 
     id_sys = p_sys->GetSubId( p_stream, id_sys, false );
@@ -823,11 +986,12 @@ static void Del(sout_stream_t *p_stream, void *_id)
             es_format_Clean( &p_sys_id->fmt );
             free( p_sys_id );
             p_sys->streams.erase( it );
+            p_sys->es_changed = true;
             break;
         }
     }
 
-    if (p_sys->out_streams.empty())
+    if (p_sys->streams.empty() && !p_sys->file)
     {
         p_sys->stopSoutChain(p_stream);
         p_sys->renderer->Stop();
@@ -838,9 +1002,65 @@ static void CloseSout( sout_stream_t *p_stream )
 {
     sout_stream_sys_t *p_sys = static_cast<sout_stream_sys_t *>( p_stream->p_sys );
 
+    if (p_sys->file)
+        p_sys->renderer->Stop();
+    p_sys->CloseFile();
+    p_sys->stopSoutChain(p_stream);
     p_sys->renderer->ConnectionComplete();
     p_sys->p_upnp->release();
     delete p_sys;
+}
+
+static int Control(sout_stream_t *stream, int query, va_list args)
+{
+    auto *sys = static_cast<sout_stream_sys_t *>(stream->p_sys);
+    if (query == SOUT_STREAM_SET_PAUSE_STATE)
+    {
+        sys->file_paused = va_arg(args, int) != 0;
+        if (!sys->file)
+            return VLC_EGENERIC;
+        msg_Dbg(stream, "Forwarding renderer %s", sys->file_paused ? "Pause" : "Play");
+        return sys->file_paused ? sys->renderer->Pause() : sys->renderer->Play("1");
+    }
+    if (query == SOUT_STREAM_SET_TIME)
+    {
+        sys->file_position = va_arg(args, vlc_tick_t);
+        if (!sys->file)
+            return VLC_EGENERIC;
+        msg_Dbg(stream, "Forwarding renderer Seek to %s",
+                dlna_seek_time(sys->file_position).c_str());
+        return sys->renderer->Seek(sys->file_position, sys->file_paused);
+    }
+    if (query == SOUT_STREAM_STOP)
+    {
+        if (!sys->file)
+            return VLC_EGENERIC;
+        /* Decoder teardown can still deliver queued packets. They must not
+         * reopen the endpoint after the user has stopped this input. */
+        sys->file_stopped = true;
+        const int ret = sys->renderer->Stop();
+        sys->CloseFile();
+        return ret;
+    }
+    if (query == SOUT_STREAM_SET_INPUT_URI)
+    {
+        if (sys->file)
+            sys->renderer->Stop();
+        sys->CloseFile();
+        const char *uri = va_arg(args, const char *);
+        sys->input_uri = uri ? uri : "";
+        sys->file_position = 0;
+        sys->file_paused = false;
+        sys->file_stopped = false;
+        sys->es_changed = true;
+        return VLC_SUCCESS;
+    }
+    if (query != SOUT_STREAM_IS_SYNCHRONOUS)
+        return VLC_EGENERIC;
+    /* HTTP streaming cannot pace the input. Otherwise a local file reaches
+     * EOF and tears down the endpoint before the renderer can consume it. */
+    *va_arg(args, bool *) = true;
+    return VLC_SUCCESS;
 }
 
 static const struct sout_stream_operations ops = [] {
@@ -848,6 +1068,7 @@ static const struct sout_stream_operations ops = [] {
     ops.add = Add;
     ops.del = Del;
     ops.send = Send;
+    ops.control = Control;
     ops.flush = Flush;
     ops.close = CloseSout;
     return ops;

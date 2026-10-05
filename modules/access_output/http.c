@@ -57,6 +57,8 @@ static void Close( vlc_object_t * );
 #define MIME_TEXT N_("Mime")
 #define MIME_LONGTEXT N_("MIME returned by the server (autodetected " \
                         "if not specified)." )
+#define DLNA_TEXT N_("DLNA content features")
+#define DLNA_LONGTEXT N_("DLNA content features returned in HTTP responses.")
 #define METACUBE_TEXT N_("Metacube")
 #define METACUBE_LONGTEXT N_("Use the Metacube protocol. Needed for streaming " \
                              "to the Cubemap reflector.")
@@ -73,6 +75,7 @@ vlc_module_begin ()
     add_password(SOUT_CFG_PREFIX "pwd", "", PASS_TEXT, PASS_LONGTEXT)
     add_string( SOUT_CFG_PREFIX "mime", "",
                 MIME_TEXT, MIME_LONGTEXT )
+    add_string( SOUT_CFG_PREFIX "dlna", "", DLNA_TEXT, DLNA_LONGTEXT )
     add_bool( SOUT_CFG_PREFIX "metacube", false,
               METACUBE_TEXT, METACUBE_LONGTEXT )
     set_callbacks( Open, Close )
@@ -83,7 +86,7 @@ vlc_module_end ()
  * Exported prototypes
  *****************************************************************************/
 static const char *const ppsz_sout_options[] = {
-    "user", "pwd", "mime", "metacube", NULL
+    "user", "pwd", "mime", "metacube", "dlna", NULL
 };
 
 static ssize_t Write( sout_access_out_t *, block_t * );
@@ -280,6 +283,35 @@ static int Open( vlc_object_t *p_this )
                                               ARRAY_SIZE(headers) );
         if( err != VLC_SUCCESS )
         {
+            free( p_sys );
+            return err;
+        }
+    }
+
+    char *dlna = var_GetNonEmptyString( p_access, SOUT_CFG_PREFIX "dlna" );
+    if( dlna != NULL )
+    {
+        /* Content features are a single header value, never arbitrary HTTP
+         * headers. Reject CR/LF to prevent response header injection. */
+        if( strpbrk( dlna, "\r\n" ) != NULL )
+        {
+            free( dlna );
+            httpd_StreamDelete( p_sys->p_httpd_stream );
+            httpd_HostDelete( p_sys->p_httpd_host );
+            free( p_sys );
+            return VLC_EGENERIC;
+        }
+        const httpd_header headers[] = {
+            { (char *)"contentFeatures.dlna.org", dlna },
+            { (char *)"transferMode.dlna.org", (char *)"Streaming" },
+        };
+        int err = httpd_StreamSetHTTPHeaders( p_sys->p_httpd_stream, headers,
+                                             ARRAY_SIZE(headers) );
+        free( dlna );
+        if( err != VLC_SUCCESS )
+        {
+            httpd_StreamDelete( p_sys->p_httpd_stream );
+            httpd_HostDelete( p_sys->p_httpd_host );
             free( p_sys );
             return err;
         }

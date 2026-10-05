@@ -218,6 +218,12 @@ vlc_tests += {
 }
 
 vlc_tests += {
+    'name' : 'test_modules_stream_out_dlna',
+    'sources' : files('stream_out/dlna.cpp'),
+    'suite' : ['modules', 'test_modules'],
+}
+
+vlc_tests += {
     'name' : 'test_modules_stream_out_transcode',
     'sources' : files(
         'stream_out/transcode.c',

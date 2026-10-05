@@ -123,6 +123,16 @@ typedef struct httpd_file_t     httpd_file_t;
 typedef struct httpd_file_sys_t httpd_file_sys_t;
 typedef int (*httpd_file_callback_t)( httpd_file_sys_t *, httpd_file_t *, uint8_t *psz_request, uint8_t **pp_data, size_t *pi_data );
 VLC_API httpd_file_t * httpd_FileNew( httpd_host_t *, const char *psz_url, const char *psz_mime, const char *psz_user, const char *psz_password, httpd_file_callback_t pf_fill, httpd_file_sys_t * ) VLC_USED;
+
+/**
+ * Serve a regular file with HEAD, Content-Length and single byte ranges.
+ * The descriptor is duplicated; the caller retains ownership of fd. Custom
+ * headers are copied. The file must remain unchanged while it is served.
+ */
+VLC_API httpd_file_t *httpd_FileNewFromFd( httpd_host_t *, const char *url,
+                                        const char *mime, int fd,
+                                        const httpd_header *, size_t header_count ) VLC_USED;
+
 VLC_API httpd_file_sys_t * httpd_FileDelete( httpd_file_t * );
 
 

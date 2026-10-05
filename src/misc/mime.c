@@ -84,6 +84,8 @@ static const struct
     { ".wmv",   "video/x-ms-wmv" },
     { ".webm",  "video/webm" },
     { ".mp4",   "video/mp4" },
+    { ".mkv",   "video/x-matroska" },
+    { ".mka",   "audio/x-matroska" },
 
     /* end */
     { "",       "" }
